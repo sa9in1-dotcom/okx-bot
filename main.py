@@ -35,13 +35,14 @@ async def get_candles(session, inst_id, bar="1H", limit=50):
     params = {"instId": inst_id, "bar": bar, "limit": limit}
     async with session.get(url, params=params) as r:
         data = await r.json()
-    closes = []
+    closes, opens = [], []
     for c in reversed(data.get("data", [])):
         try:
+            opens.append(float(c[1]))
             closes.append(float(c[4]))
         except:
             continue
-    return closes
+    return closes, opens
 
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -60,6 +61,17 @@ def calc_rsi(closes, period=14):
         return 100.0
     return round(100 - (100 / (1 + ag/al)), 2)
 
+def rsi_slope(closes, period=14, lookback=3):
+    if len(closes) < period + lookback + 1:
+        return None
+    rsi_values = []
+    for i in range(lookback + 1):
+        subset = closes[:len(closes)-i] if i > 0 else closes
+        rsi_values.append(calc_rsi(subset, period))
+    if None in rsi_values:
+        return None
+    return rsi_values[0] - rsi_values[-1]
+
 async def send_telegram(session, message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -68,14 +80,16 @@ async def send_telegram(session, message):
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
-def format_alert(coin, change24h, price, rsi_1h, rsi_4h):
+def format_alert(coin, change24h, price, rsi_1h, rsi_4h, slope_1h, slope_4h):
     symbol = coin.replace("-USDT-SWAP", "")
+    slope_1h_str = f"↑{slope_1h:.1f}" if slope_1h and slope_1h > 0 else f"↓{abs(slope_1h):.1f}" if slope_1h else "N/A"
+    slope_4h_str = f"↑{slope_4h:.1f}" if slope_4h and slope_4h > 0 else f"↓{abs(slope_4h):.1f}" if slope_4h else "N/A"
     return (
         f"🔴 <b>ШОРТ СЕТАП — {symbol}</b>\n\n"
         f"💰 Цена: <b>${price:,.4f}</b>\n"
         f"📈 Рост за 24ч: <b>+{change24h:.1f}%</b>\n\n"
-        f"📊 RSI 1H: <b>{rsi_1h}</b>\n"
-        f"📊 RSI 4H: <b>{rsi_4h}</b>\n\n"
+        f"📊 RSI 1H: <b>{rsi_1h}</b> {slope_1h_str}\n"
+        f"📊 RSI 4H: <b>{rsi_4h}</b> {slope_4h_str}\n\n"
         f"🎯 Цели: ${price*0.93:,.4f} → ${price*0.85:,.4f} → ${price*0.78:,.4f}\n"
         f"🛑 Стоп: выше ${price*1.05:,.4f}\n\n"
         f"⏰ {datetime.now().strftime('%H:%M:%S')}"
@@ -85,7 +99,7 @@ alerted = {}
 
 async def run():
     async with aiohttp.ClientSession() as session:
-        await send_telegram(session, "🤖 <b>OKX Short Bot запущен!</b>\nИщу монеты +20% с RSI 75+")
+        await send_telegram(session, "🤖 <b>OKX Short Bot запущен!</b>\nМониторинг 281 пары\nКритерии: +20% за 24ч | RSI 75+ | RSI растёт | Свеча зелёная\nПроверка каждую минуту")
         while True:
             try:
                 tickers = await get_futures_tickers(session)
@@ -95,14 +109,28 @@ async def run():
                     inst_id = coin["instId"]
                     if time.time() - alerted.get(inst_id, 0) < 7200:
                         continue
-                    rsi_1h = calc_rsi(await get_candles(session, inst_id, "1H"))
+                    closes_1h, opens_1h = await get_candles(session, inst_id, "1H")
                     await asyncio.sleep(0.1)
-                    rsi_4h = calc_rsi(await get_candles(session, inst_id, "4H"))
+                    closes_4h, opens_4h = await get_candles(session, inst_id, "4H")
                     await asyncio.sleep(0.1)
-                    if (rsi_1h and rsi_1h >= RSI_THRESHOLD) or (rsi_4h and rsi_4h >= RSI_THRESHOLD):
-                        await send_telegram(session, format_alert(inst_id, coin["change24h"], coin["last"], rsi_1h, rsi_4h))
+
+                    rsi_1h = calc_rsi(closes_1h)
+                    rsi_4h = calc_rsi(closes_4h)
+                    slope_1h = rsi_slope(closes_1h)
+                    slope_4h = rsi_slope(closes_4h)
+
+                    # Проверка RSI порога
+                    rsi_ok = (rsi_1h and rsi_1h >= RSI_THRESHOLD) or (rsi_4h and rsi_4h >= RSI_THRESHOLD)
+                    # Momentum: RSI растёт
+                    momentum_ok = (slope_1h and slope_1h > 0) or (slope_4h and slope_4h > 0)
+                    # Последняя свеча зелёная
+                    green_1h = len(closes_1h) > 0 and len(opens_1h) > 0 and closes_1h[-1] > opens_1h[-1]
+
+                    if rsi_ok and momentum_ok and green_1h:
+                        msg = format_alert(inst_id, coin["change24h"], coin["last"], rsi_1h, rsi_4h, slope_1h, slope_4h)
+                        await send_telegram(session, msg)
                         alerted[inst_id] = time.time()
-                        log.info(f"Алерт: {inst_id}")
+                        log.info(f"Алерт: {inst_id} RSI1H={rsi_1h} RSI4H={rsi_4h}")
             except Exception as e:
                 log.error(f"Ошибка: {e}")
             await asyncio.sleep(CHECK_INTERVAL)
